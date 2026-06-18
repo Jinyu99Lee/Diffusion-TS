@@ -5,7 +5,7 @@ import numpy as np
 
 from engine.logger import Logger
 from engine.solver import Trainer
-from Data.build_dataloader import build_dataloader, build_dataloader_cond
+from Data.build_dataloader import build_dataloader, build_dataloader_cond, build_val_dataloader
 from Models.interpretable_diffusion.model_utils import unnormalize_to_zero_to_one
 from Utils.io_utils import load_yaml_config, seed_everything, merge_opts_to_config, instantiate_from_config
 
@@ -70,7 +70,10 @@ def main():
     if args.sample == 1 and args.mode in ['infill', 'predict']:
         test_dataloader_info = build_dataloader_cond(config, args)
     dataloader_info = build_dataloader(config, args)
-    trainer = Trainer(config=config, args=args, model=model, dataloader=dataloader_info, logger=logger)
+    val_dataloader_info = build_val_dataloader(config, args)
+    val_dl = val_dataloader_info['dataloader'] if val_dataloader_info is not None else None
+    trainer = Trainer(config=config, args=args, model=model, dataloader=dataloader_info, logger=logger,
+                      val_dataloader=val_dl)
 
     if args.train:
         trainer.train()

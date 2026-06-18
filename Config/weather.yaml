@@ -1,0 +1,73 @@
+model:
+  target: Models.interpretable_diffusion.gaussian_diffusion.Diffusion_TS
+  params:
+    seq_length: 84        # T  (must match the npz; override per run)
+    feature_size: 5       # D  (override per run to match the npz)
+    n_layer_enc: 3
+    n_layer_dec: 2
+    d_model: 64
+    timesteps: 500
+    sampling_timesteps: 500
+    loss_type: 'l1'
+    beta_schedule: 'cosine'
+    n_heads: 4
+    mlp_hidden_times: 4
+    attn_pd: 0.0
+    resid_pd: 0.0
+    kernel_size: 1
+    padding_size: 0
+
+solver:
+  base_lr: 1.0e-5
+  max_epochs: 18000
+  results_folder: ./Checkpoints_weather
+  gradient_accumulate_every: 2
+  save_cycle: 1800          # also the validation-eval cycle
+  val_seed: 2024
+  val_num_repeats: 3
+  ema:
+    decay: 0.995
+    update_interval: 10
+
+  scheduler:
+    target: engine.lr_sch.ReduceLROnPlateauWithWarmup
+    params:
+      factor: 0.5
+      patience: 4000
+      min_lr: 1.0e-5
+      threshold: 1.0e-1
+      threshold_mode: rel
+      warmup_lr: 8.0e-4
+      warmup: 500
+      verbose: False
+
+dataloader:
+  # Weather: single pre-windowed npz split in-framework (mirrors timeVAE's
+  # --split-method full_train_recent_blocks). Train and val read the SAME npz;
+  # the split is deterministic so they are disjoint.
+  train_dataset:
+    target: Utils.Data_utils.npz_datasets.NPZDataset
+    params:
+      name: weather
+      data_path: ./Data/datasets/weather/T84/weather_london_2003_2014.npz
+      split_method: full_train_recent_blocks
+      valid_perc: 0.1
+      period: train
+      neg_one_to_one: True
+      seed: 123
+
+  val_dataset:
+    target: Utils.Data_utils.npz_datasets.NPZDataset
+    params:
+      name: weather
+      data_path: ./Data/datasets/weather/T84/weather_london_2003_2014.npz
+      split_method: full_train_recent_blocks
+      valid_perc: 0.1
+      period: val
+      neg_one_to_one: True
+      seed: 123
+
+  batch_size: 128
+  val_batch_size: 128
+  sample_size: 256
+  shuffle: True

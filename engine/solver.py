@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import time
 import torch
 import numpy as np
@@ -22,7 +23,7 @@ def cycle(dl):
 
 
 class Trainer(object):
-    def __init__(self, config, args, model, dataloader, logger=None):
+    def __init__(self, config, args, model, dataloader, logger=None, val_dataloader=None):
         super().__init__()
         self.model = model
         self.device = self.model.betas.device
@@ -35,6 +36,15 @@ class Trainer(object):
         self.milestone = 0
         self.args, self.config = args, config
         self.logger = logger
+
+        # ---- validation-loss tracking (used by HPO) ---- #
+        self.val_dataloader = val_dataloader
+        self.val_seed = int(config['solver'].get('val_seed', 2024))
+        self.val_num_repeats = int(config['solver'].get('val_num_repeats', 3))
+        self.best_val_loss = float('inf')
+        self.best_val_milestone = -1
+        self.train_loss_history = []  # list of (step, train_loss)
+        self.val_loss_history = []    # list of (step, val_loss)
 
         self.results_folder = Path(config['solver']['results_folder'] + f'_{model.seq_length}')
         os.makedirs(self.results_folder, exist_ok=True)
@@ -74,11 +84,56 @@ class Trainer(object):
         }
         torch.save(data, str(self.results_folder / f'ckpt_classfier-{milestone}.pt'))
 
+    @torch.no_grad()
+    def evaluate_val_loss(self):
+        """Average diffusion (val) loss of the EMA model over the val set.
+
+        The diffusion loss samples a random timestep / noise per call, so we fix
+        the seed and average over a few passes to make the value comparable
+        across checkpoints and across HPO configs. No histogram metric is used.
+        """
+        if self.val_dataloader is None:
+            return None
+        was_training = self.ema.ema_model.training
+        self.ema.ema_model.eval()
+        rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        torch.manual_seed(self.val_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.val_seed)
+
+        total, count = 0.0, 0
+        for _ in range(self.val_num_repeats):
+            for data in self.val_dataloader:
+                data = data.to(self.device)
+                loss = self.ema.ema_model(data, target=data)
+                total += loss.item() * data.shape[0]
+                count += data.shape[0]
+
+        torch.set_rng_state(rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_state)
+        if was_training:
+            self.ema.ema_model.train()
+        return total / max(count, 1)
+
+    def _write_val_metrics(self, current_val_loss):
+        metrics = {
+            'best_val_loss': self.best_val_loss,
+            'best_val_milestone': self.best_val_milestone,
+            'last_val_loss': current_val_loss,
+            'last_milestone': self.milestone,
+            'last_step': self.step,
+        }
+        with open(str(self.results_folder / 'val_metrics.json'), 'w') as f:
+            json.dump(metrics, f, indent=2)
+
     def load(self, milestone, verbose=False):
         if self.logger is not None and verbose:
             self.logger.log_info('Resume from {}'.format(str(self.results_folder / f'checkpoint-{milestone}.pt')))
         device = self.device
-        data = torch.load(str(self.results_folder / f'checkpoint-{milestone}.pt'), map_location=device)
+        name = 'checkpoint-best.pt' if milestone == 'best' else f'checkpoint-{milestone}.pt'
+        data = torch.load(str(self.results_folder / name), map_location=device)
         self.model.load_state_dict(data['model'])
         self.step = data['step']
         self.opt.load_state_dict(data['opt'])
@@ -126,7 +181,24 @@ class Trainer(object):
                         self.milestone += 1
                         self.save(self.milestone)
                         # self.logger.log_info('saved in {}'.format(str(self.results_folder / f'checkpoint-{self.milestone}.pt')))
-                    
+
+                        val_loss = self.evaluate_val_loss()
+                        if val_loss is not None:
+                            self.val_loss_history.append((self.step, val_loss))
+                            if val_loss < self.best_val_loss:
+                                self.best_val_loss = val_loss
+                                self.best_val_milestone = self.milestone
+                                self.save('best')
+                            self._write_val_metrics(val_loss)
+                            if self.logger is not None:
+                                self.logger.add_scalar(tag='val/loss', scalar_value=val_loss, global_step=self.step)
+                                self.logger.log_info(
+                                    'step {}: val_loss={:.6f} (best={:.6f} @milestone {})'.format(
+                                        self.step, val_loss, self.best_val_loss, self.best_val_milestone))
+
+                    if self.step % self.log_frequency == 0:
+                        self.train_loss_history.append((self.step, total_loss))
+
                     if self.logger is not None and self.step % self.log_frequency == 0:
                         # info = '{}: train'.format(self.args.name)
                         # info = info + ': Epoch {}/{}'.format(self.step, self.train_num_steps)
@@ -140,8 +212,51 @@ class Trainer(object):
                 pbar.update(1)
 
         print('training complete')
+        self._save_loss_curve()
         if self.logger is not None:
             self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
+
+    def _save_loss_curve(self):
+        """Save a per-run train/val loss curve as PDF into the results folder."""
+        if not self.train_loss_history and not self.val_loss_history:
+            return
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except Exception as e:  # matplotlib missing / headless issue
+            if self.logger is not None:
+                self.logger.log_info(f'Skip loss curve (matplotlib unavailable): {e}')
+            return
+
+        fig, ax1 = plt.subplots(figsize=(8, 5))
+        if self.train_loss_history:
+            ts, tl = zip(*self.train_loss_history)
+            ax1.plot(ts, tl, color='tab:blue', label='train loss', linewidth=1.0)
+        ax1.set_xlabel('step')
+        ax1.set_ylabel('train loss', color='tab:blue')
+        ax1.tick_params(axis='y', labelcolor='tab:blue')
+
+        if self.val_loss_history:
+            ax2 = ax1.twinx()
+            vs, vl = zip(*self.val_loss_history)
+            ax2.plot(vs, vl, color='tab:red', marker='o', markersize=3,
+                     label='val loss', linewidth=1.0)
+            ax2.set_ylabel('val loss', color='tab:red')
+            ax2.tick_params(axis='y', labelcolor='tab:red')
+            if self.best_val_milestone >= 0:
+                ax2.axhline(self.best_val_loss, color='tab:red', linestyle='--',
+                            linewidth=0.8, alpha=0.6)
+
+        name = getattr(self.args, 'name', 'run')
+        plt.title(f'{name}: best val={self.best_val_loss:.5f} @milestone {self.best_val_milestone}')
+        fig.tight_layout()
+        out = str(self.results_folder / 'loss_curve.pdf')
+        fig.savefig(out)
+        plt.close(fig)
+        if self.logger is not None:
+            self.logger.log_info(f'Saved loss curve to {out}')
+        print(f'saved loss curve to {out}')
 
     def sample(self, num, size_every, shape=None, model_kwargs=None, cond_fn=None):
         if self.logger is not None:

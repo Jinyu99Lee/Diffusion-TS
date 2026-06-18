@@ -23,6 +23,27 @@ def build_dataloader(config, args=None):
 
     return dataload_info
 
+def build_val_dataloader(config, args=None):
+    """Build the validation dataloader if a ``val_dataset`` block is present.
+
+    Returns None when no validation set is configured (keeps legacy configs working).
+    """
+    if config['dataloader'].get('val_dataset') is None:
+        return None
+    batch_size = config['dataloader'].get('val_batch_size', config['dataloader']['batch_size'])
+    config['dataloader']['val_dataset']['params']['output_dir'] = args.save_dir
+    dataset = instantiate_from_config(config['dataloader']['val_dataset'])
+
+    dataloader = torch.utils.data.DataLoader(dataset,
+                                             batch_size=batch_size,
+                                             shuffle=False,
+                                             num_workers=0,
+                                             pin_memory=True,
+                                             sampler=None,
+                                             drop_last=False)
+    return {'dataloader': dataloader, 'dataset': dataset}
+
+
 def build_dataloader_cond(config, args=None):
     batch_size = config['dataloader']['sample_size']
     config['dataloader']['test_dataset']['params']['output_dir'] = args.save_dir
