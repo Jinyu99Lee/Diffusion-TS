@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Generate one rerun+eval script per finished ILI HPO sub-experiment.
 
-Scans ``outputs/hpo/ili/<periodfolder>/<tau>/<expname>/best_run.json`` (written
-by ``hpo_grid_search.py``) and emits
-``scripts/hpo/ili_rerun/<periodfolder>/<tau>/rerun_<expname>.sh``.
+Scans ``outputs/hpo/<dataset>/<periodfolder>/<tau>/<expname>/best_run.json``
+(written by ``hpo_grid_search.py``) and emits
+``scripts/hpo/<dataset>_rerun/<periodfolder>/<tau>/rerun_<expname>.sh``.
+``<dataset>`` is ``--dataset`` (default ``ili``; e.g. ``ili_delta``) and also
+namespaces the scripts' log dir (``Logs/hpo/<dataset>_rerun``).
 
 Each emitted script takes a GPU id as ``$1`` (default 0) and, in one detached
 subshell:
@@ -19,7 +21,7 @@ which polls GPU memory to find a free card, works unchanged. Pass the generated
 ``scripts/hpo/ili_rerun/manifest.txt`` to it as the 3rd argument.
 
 Re-run this generator whenever new ``best_run.json`` files appear under
-``outputs/hpo/ili``.
+``outputs/hpo/<dataset>``.
 """
 from __future__ import annotations
 
@@ -30,7 +32,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]          # .../Diffusion-TS
 PROJ_ROOT = REPO_ROOT.parent                             # .../Projects (holds timeVAE/)
-OUT_ROOT = REPO_ROOT / "outputs" / "hpo" / "ili"
 
 SCRIPT_TEMPLATE = """\
 #!/usr/bin/env bash
@@ -40,11 +41,11 @@ set -euo pipefail
 GPU="${{1:-0}}"
 REPO={repo}
 PROJ={proj}
-EXP="$REPO/outputs/hpo/ili/{periodfolder}/{tau}/{expname}"
+EXP="$REPO/outputs/hpo/{dataset}/{periodfolder}/{tau}/{expname}"
 DATA="$REPO/{train_npz}"
-mkdir -p "$REPO/Logs/hpo/ili_rerun/{periodfolder}/{tau}"
+mkdir -p "$REPO/Logs/hpo/{dataset}_rerun/{periodfolder}/{tau}"
 TS=$(date +%F_%H-%M-%S)
-LOG="$REPO/Logs/hpo/ili_rerun/{periodfolder}/{tau}/{expname}_${{TS}}.log"
+LOG="$REPO/Logs/hpo/{dataset}_rerun/{periodfolder}/{tau}/{expname}_${{TS}}.log"
 (
   set -euo pipefail
   source /data/jinyuli/anaconda3/etc/profile.d/conda.sh
@@ -64,12 +65,12 @@ echo "[launched] {expname} on GPU ${{GPU}}  pid=$!  log=$LOG"
 """
 
 
-def discover():
+def discover(out_root: Path):
     """Yield dicts describing each sub-experiment that has a best_run.json."""
     items = []
-    for bj in sorted(OUT_ROOT.rglob("best_run.json")):
+    for bj in sorted(out_root.rglob("best_run.json")):
         exp_dir = bj.parent
-        rel = exp_dir.relative_to(OUT_ROOT)               # <periodfolder>/<tau>/<expname>
+        rel = exp_dir.relative_to(out_root)               # <periodfolder>/<tau>/<expname>
         if len(rel.parts) != 3:
             print(f"[skip] unexpected depth: {bj.relative_to(REPO_ROOT)}")
             continue
@@ -97,14 +98,21 @@ def discover():
 
 def main():
     ap = argparse.ArgumentParser(description="Generate per-sub-experiment ILI rerun+eval scripts.")
-    ap.add_argument("--out-dir", default=str(REPO_ROOT / "scripts" / "hpo" / "ili_rerun"),
-                    help="Where to write the rerun_*.sh tree (default scripts/hpo/ili_rerun).")
+    ap.add_argument("--dataset", default="ili",
+                    help="Dataset tree under outputs/hpo/ to scan (e.g. ili, "
+                         "ili_delta). Also namespaces Logs/hpo/<dataset>_rerun "
+                         "and the default --out-dir.")
+    ap.add_argument("--out-dir", default=None,
+                    help="Where to write the rerun_*.sh tree "
+                         "(default scripts/hpo/<dataset>_rerun).")
     ap.add_argument("--dry-run", action="store_true",
                     help="List intended scripts without writing anything.")
     args = ap.parse_args()
 
-    out_dir = Path(args.out_dir)
-    items = discover()
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else (
+        REPO_ROOT / "scripts" / "hpo" / f"{args.dataset}_rerun"
+    )
+    items = discover(REPO_ROOT / "outputs" / "hpo" / args.dataset)
 
     manifest_lines = []
     for it in items:
@@ -115,7 +123,8 @@ def main():
             print(f"[dry] {script_path.relative_to(REPO_ROOT)}")
             continue
         script_dir.mkdir(parents=True, exist_ok=True)
-        content = SCRIPT_TEMPLATE.format(repo=REPO_ROOT, proj=PROJ_ROOT, **it)
+        content = SCRIPT_TEMPLATE.format(repo=REPO_ROOT, proj=PROJ_ROOT,
+                                         dataset=args.dataset, **it)
         script_path.write_text(content)
         script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         print(f"[write] {script_path.relative_to(REPO_ROOT)}")

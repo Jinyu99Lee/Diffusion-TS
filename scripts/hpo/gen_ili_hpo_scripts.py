@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Generate one self-contained HPO launch script per ILI sub-experiment.
 
-Scans ``Data/datasets/ili/<periodfolder>/<tau>/<stem>_train.npz`` (each paired
-with a ``*_val.npz``) and emits ``scripts/hpo/ili/<periodfolder>/<tau>/run_<expname>.sh``.
+Scans ``Data/datasets/<dataset>/<periodfolder>/<tau>/<stem>_train.npz`` (each
+paired with a ``*_val.npz``) and emits
+``scripts/hpo/<dataset>/<periodfolder>/<tau>/run_<expname>.sh``. ``<dataset>``
+is ``--dataset`` (default ``ili``; e.g. ``ili_delta``) and also namespaces the
+scripts' log dir (``Logs/hpo/<dataset>``) and output root
+(``outputs/hpo/<dataset>``), so variants never collide.
 
 Each emitted script takes a GPU id as ``$1`` (default 0) and launches
 ``hpo_grid_search.py`` for that single sub-experiment, pinning its 4-job grid to
 one card via ``--gpu-slots "<gpu>:2"``. Run up to 3 scripts at once (GPU 0/1/2).
 
-Re-run this generator whenever the npz set under Data/datasets/ili changes.
+Re-run this generator whenever the npz set under Data/datasets/<dataset> changes.
 """
 from __future__ import annotations
 
@@ -19,7 +23,6 @@ import stat
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DATA_ROOT = REPO_ROOT / "Data" / "datasets" / "ili"
 
 # ili_<region>_<y1>_<y2>_T<T>_p<P>_train
 STEM_RE = re.compile(
@@ -34,28 +37,28 @@ set -euo pipefail
 GPU="${{1:-0}}"
 REPO={repo}
 cd "$REPO"
-mkdir -p Logs/hpo/ili/{periodfolder}/{tau}
+mkdir -p Logs/hpo/{dataset}/{periodfolder}/{tau}
 TS=$(date +%F_%H-%M-%S)
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 nohup python hpo_grid_search.py \\
   --base-config Config/ili.yaml \\
-  --train-npz Data/datasets/ili/{periodfolder}/{tau}/{stem}_train.npz \\
-  --val-npz   Data/datasets/ili/{periodfolder}/{tau}/{stem}_val.npz \\
+  --train-npz Data/datasets/{dataset}/{periodfolder}/{tau}/{stem}_train.npz \\
+  --val-npz   Data/datasets/{dataset}/{periodfolder}/{tau}/{stem}_val.npz \\
   --d-model 64 128 \\
   --base-lr 1e-5 \\
   --batch-size 64 128 \\
   --max-epochs 18000 --save-cycle 1800 --val-num-repeats 1 \\
   --gpu-slots "${{GPU}}:2" \\
   --experiment-name {expname} \\
-  --output-root outputs/hpo/ili/{periodfolder}/{tau} \\
-  > "Logs/hpo/ili/{periodfolder}/{tau}/{expname}_${{TS}}.log" 2>&1 &
-echo "[launched] {expname} on GPU ${{GPU}}  pid=$!  log=Logs/hpo/ili/{periodfolder}/{tau}/{expname}_${{TS}}.log"
+  --output-root outputs/hpo/{dataset}/{periodfolder}/{tau} \\
+  > "Logs/hpo/{dataset}/{periodfolder}/{tau}/{expname}_${{TS}}.log" 2>&1 &
+echo "[launched] {expname} on GPU ${{GPU}}  pid=$!  log=Logs/hpo/{dataset}/{periodfolder}/{tau}/{expname}_${{TS}}.log"
 """
 
 
-def discover():
-    """Yield dicts describing each sub-experiment found under DATA_ROOT."""
+def discover(data_root: Path):
+    """Yield dicts describing each sub-experiment found under ``data_root``."""
     items = []
-    for train in sorted(DATA_ROOT.rglob("*_train.npz")):
+    for train in sorted(data_root.rglob("*_train.npz")):
         # train.name like 'ili_eng_2015_2016_T42_p14_train.npz'
         base = train.name[: -len(".npz")]  # 'ili_..._train'
         m = STEM_RE.match(base)
@@ -66,7 +69,7 @@ def discover():
         if not val.exists():
             print(f"[warn] missing val for {train.relative_to(REPO_ROOT)} -> skip")
             continue
-        rel = train.relative_to(DATA_ROOT)            # <periodfolder>/<tau>/<file>
+        rel = train.relative_to(data_root)            # <periodfolder>/<tau>/<file>
         periodfolder, tau = rel.parts[0], rel.parts[1]
         file_stem = base[: -len("_train")]            # 'ili_eng_2015_2016_T42_p14'
         gd = m.groupdict()
@@ -82,14 +85,22 @@ def discover():
 
 def main():
     ap = argparse.ArgumentParser(description="Generate per-sub-experiment ILI HPO scripts.")
-    ap.add_argument("--out-dir", default=str(REPO_ROOT / "scripts" / "hpo" / "ili"),
-                    help="Where to write the run_*.sh tree (default scripts/hpo/ili).")
+    ap.add_argument("--dataset", default="ili",
+                    help="Dataset tree under Data/datasets/ to scan (e.g. ili, "
+                         "ili_delta). Also namespaces Logs/hpo/, outputs/hpo/ "
+                         "and the default --out-dir.")
+    ap.add_argument("--out-dir", default=None,
+                    help="Where to write the run_*.sh tree "
+                         "(default scripts/hpo/<dataset>).")
     ap.add_argument("--dry-run", action="store_true",
                     help="List intended scripts without writing anything.")
     args = ap.parse_args()
 
-    out_dir = Path(args.out_dir)
-    items = discover()
+    data_root = REPO_ROOT / "Data" / "datasets" / args.dataset
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else (
+        REPO_ROOT / "scripts" / "hpo" / args.dataset
+    )
+    items = discover(data_root)
 
     manifest_lines = []
     for it in items:
@@ -100,7 +111,7 @@ def main():
             print(f"[dry] {script_path.relative_to(REPO_ROOT)}")
             continue
         script_dir.mkdir(parents=True, exist_ok=True)
-        content = SCRIPT_TEMPLATE.format(repo=REPO_ROOT, **it)
+        content = SCRIPT_TEMPLATE.format(repo=REPO_ROOT, dataset=args.dataset, **it)
         script_path.write_text(content)
         script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         print(f"[write] {script_path.relative_to(REPO_ROOT)}")
