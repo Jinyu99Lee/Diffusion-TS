@@ -46,7 +46,7 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 nohup python hpo_grid_search.py \\
   --d-model 64 128 \\
   --base-lr 1e-5 \\
   --batch-size 64 128 \\
-  --max-epochs 18000 --save-cycle 1800 --val-num-repeats 1 \\
+  --max-epochs 18000 --save-cycle 1800 --val-num-repeats 3 \\
   --gpu-slots "${{GPU}}:2" \\
   --experiment-name {expname} \\
   --output-root outputs/hpo/{dataset}/{periodfolder}/{tau} \\

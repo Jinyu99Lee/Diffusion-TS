@@ -179,8 +179,9 @@ class Trainer(object):
                 with torch.no_grad():
                     if self.step != 0 and self.step % self.save_cycle == 0:
                         self.milestone += 1
-                        self.save(self.milestone)
-                        # self.logger.log_info('saved in {}'.format(str(self.results_folder / f'checkpoint-{self.milestone}.pt')))
+                        # keep disk usage bounded: only checkpoint-last.pt
+                        # (overwritten every cycle) and checkpoint-best.pt
+                        self.save('last')
 
                         val_loss = self.evaluate_val_loss()
                         if val_loss is not None:

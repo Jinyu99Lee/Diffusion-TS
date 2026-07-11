@@ -20,6 +20,11 @@ Samples are sliced within contiguous daily runs only (never crossing a date
 gap, a season boundary, or an excluded/val window boundary). Output arrays are
 raw (unnormalised) float32 of shape ``N x T x D`` stored under key ``data``;
 normalisation is the framework's job so the scaler is fit on train only.
+
+With ``--target-delay delta > 0`` the stored windows are "target_shifted"
+(T = seq + delta + pred): the target column lags the feature columns by delta
+days inside each window, so the generative model learns the same delayed view
+the forecaster trains on. Delta = 0 (default) keeps the legacy aligned layout.
 """
 from __future__ import annotations
 
@@ -209,8 +214,16 @@ def _collect_windows(
     pred_len: int,
     stride: int,
     forbid_mask: np.ndarray = None,
+    tail_offset: int = 0,
 ) -> List[np.ndarray]:
-    """``values`` is ``(len(index), D)``. Returns a list of ``(seq_len, D)`` windows."""
+    """``values`` is ``(len(index), D)``. Returns a list of ``(seq_len, D)`` windows.
+
+    ``tail_offset`` places the label tail ``tail_offset`` rows before the
+    window's right end: with target_shifted assembly the collected window
+    extends ``delta`` rows past the true label dates (those trailing rows
+    contribute feature values only), so the target-mask check must be applied
+    ``delta`` rows earlier. 0 (default) keeps the tail at the window end.
+    """
     one_day = pd.Timedelta(days=1)
     n = len(index)
     lookback = seq_len - pred_len
@@ -228,8 +241,8 @@ def _collect_windows(
         window = values[start:end]
         if np.isnan(window).any():
             continue
-        # predict tail must lie entirely in the target mask
-        if not target_mask[start + lookback : end].all():
+        # predict tail (label dates) must lie entirely in the target mask
+        if not target_mask[start + lookback - tail_offset : end - tail_offset].all():
             continue
         # guard: full T-span must avoid forbidden dates
         if forbid_mask is not None and forbid_mask[start:end].any():
@@ -329,29 +342,52 @@ def convert(args: argparse.Namespace) -> None:
     excluded_mask = _mask_for_ranges(index, [(w["_start"], w["_end"]) for w in excluded])
     genval_mask = _mask_for_ranges(index, [(w["_start"], w["_end"]) for w in val_windows])
 
-    # ``--seq-len`` is the lookback/context length; the stored window is the
-    # full T = lookback + pred, so the saved NPZ time dimension is
-    # ``seq_len + pred_len`` (NOT seq_len with pred carved out of it).
+    # ``--seq-len`` is the forecaster lookback; the stored window is
+    # T = seq_len + target_delay + pred_len. With --target-delay 0 (default)
+    # this is the historical aligned layout T = seq_len + pred_len. With
+    # delta > 0 the stored window is "target_shifted": row r holds
+    # X(t-seq+1+r) next to y(t-seq+1+r-delta), so the reporting delay is baked
+    # into the window itself. It is assembled from an *aligned* super-window of
+    # length T + delta (dates t-delta-seq+1 .. t+delta+pred): the X block is its
+    # rows delta..delta+T-1 and the target column its rows 0..T-1. Collecting
+    # the aligned super-window keeps the tail/forbid/contiguity mask logic of
+    # _collect_windows verbatim (its last pred rows are the label dates
+    # t+1..t+pred, and the forbid guard covers both channels' date spans).
     lookback, pred_len, stride = args.seq_len, args.pred_len, args.stride
-    total_len = lookback + pred_len
+    delta = args.target_delay
     if lookback <= 0 or pred_len <= 0:
         raise ValueError(f"--seq-len ({lookback}) and --pred-len ({pred_len}) must both be > 0.")
-    print(f"[window] T(seq_length)={total_len}  lookback(seq_len)={lookback}  pred_len={pred_len}  stride={stride}")
+    if delta < 0:
+        raise ValueError(f"--target-delay ({delta}) must be >= 0.")
+    total_len = lookback + delta + pred_len   # stored window T
+    super_len = total_len + delta             # aligned collection window
+    print(f"[window] T(seq_length)={total_len}  lookback(seq_len)={lookback}  "
+          f"target_delay={delta}  pred_len={pred_len}  stride={stride}")
 
     # Sonnet rule: only the predict tail must land in the target region; the
     # lookback prefix extends backward freely.
-    #  * train: tail in the 4 seasons, full T-span avoids gen-val AND excluded
+    #  * train: tail in the 4 seasons, full span avoids gen-val AND excluded
     #           (the guard - protects val integrity, since the whole window is a
     #            generative training example).
-    #  * val:   tail in a gen-val window, full T-span avoids excluded windows
+    #  * val:   tail in a gen-val window, full span avoids excluded windows
     #           (lookback may reuse train-season dates, which is acceptable).
+    # Tail placement with delta > 0: the super window extends delta rows past
+    # the true label dates (feature-only rows).
+    #  * val uses tail_offset=delta so labels land exactly inside the genval
+    #    event windows (mirroring Sonnet's shadow val); the feature-only rows
+    #    may stick out into ordinary season dates (excluded windows are still
+    #    guarded by forbid over the full span).
+    #  * train keeps tail_offset=0: the stricter check (label+delta in-season)
+    #    only bites at the training span's right edge, where it doubles as a
+    #    guard against test-period feature values entering the training pool.
     train_samples = _collect_windows(
-        values, index, season_mask, total_len, pred_len, stride,
+        values, index, season_mask, super_len, pred_len, stride,
         forbid_mask=(excluded_mask | genval_mask),
     )
     val_samples = _collect_windows(
-        values, index, genval_mask, total_len, pred_len, stride,
+        values, index, genval_mask, super_len, pred_len, stride,
         forbid_mask=excluded_mask,
+        tail_offset=delta,
     )
 
     if not train_samples:
@@ -359,8 +395,20 @@ def convert(args: argparse.Namespace) -> None:
     if not val_samples:
         raise RuntimeError("No val samples produced - check seq_len/pred_len vs window length.")
 
-    train_arr = np.stack(train_samples).astype(np.float32)
-    val_arr = np.stack(val_samples).astype(np.float32)
+    def _to_target_shifted(windows: List[np.ndarray]) -> List[np.ndarray]:
+        """Aligned super-window (T+delta, D) -> stored window (T, D) with the
+        target column (last) lagging the feature columns by delta days."""
+        if delta == 0:
+            return windows
+        out = []
+        for w in windows:
+            shifted = w[delta : delta + total_len].copy()
+            shifted[:, -1] = w[:total_len, -1]
+            out.append(shifted)
+        return out
+
+    train_arr = np.stack(_to_target_shifted(train_samples)).astype(np.float32)
+    val_arr = np.stack(_to_target_shifted(val_samples)).astype(np.float32)
     print(f"[shapes] train {train_arr.shape}  val {val_arr.shape}")
 
     # --- save ------------------------------------------------------------- #
@@ -374,8 +422,12 @@ def convert(args: argparse.Namespace) -> None:
         test_period=f"{Y}/{test_end_year}",
         shadow_val_period=f"{Y-2}/{Y-1}",
         seq_len=total_len,
-        lookback=lookback,
+        # rows before the pred tail in the STORED window (= forecaster seq +
+        # target_delay); the Sonnet synthetic loader validates against this.
+        lookback=lookback + delta,
         pred_len=pred_len,
+        target_delay=delta,
+        layout="target_shifted" if delta > 0 else "aligned",
         stride=stride,
         window_days=days,
         tau=args.tau,
@@ -415,12 +467,16 @@ def parse_args() -> argparse.Namespace:
                         "fix one tau feature set across different test periods (per-period "
                         "tau lists differ, e.g. 2015_2016 vs 2016_2017 at tau=0.5).")
     p.add_argument("--seq-len", type=int, required=True,
-                   help="Lookback/context length (= the lookback prefix). The stored window "
-                        "is the full T = seq_len + pred_len, so the saved NPZ time dimension "
-                        "is seq_len + pred_len.")
+                   help="Forecaster lookback/context length. The stored window is the full "
+                        "T = seq_len + target_delay + pred_len.")
     p.add_argument("--pred-len", type=int, required=True,
                    help="Predict tail length P; only this tail must fall in the target window. "
-                        "Appended after the seq_len lookback (T = seq_len + P).")
+                        "Appended after the lookback (T = seq_len + target_delay + P).")
+    p.add_argument("--target-delay", type=int, default=0,
+                   help="Reporting delay delta in days (eng=7, us=14; default 0 = legacy "
+                        "aligned layout). With delta>0 the stored window is 'target_shifted': "
+                        "the target column lags the feature columns by delta days inside the "
+                        "window, mirroring the delayed view the forecaster trains on.")
     p.add_argument("--stride", type=int, default=1, help="Window-start stride (default 1).")
     p.add_argument("--window-days", type=int, default=60,
                    help="onset/peak/offset window length in days (Sonnet uses 60).")

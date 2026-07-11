@@ -37,7 +37,8 @@ def parse_args():
                         choices=[0, 1], help='Condition or Uncondition.')
     parser.add_argument('--mode', type=str, default='infill',
                         help='Infilling or Forecasting.')
-    parser.add_argument('--milestone', type=int, default=10)
+    parser.add_argument('--milestone', type=str, default='last',
+                        help="Checkpoint to load: 'last', 'best', or a legacy milestone number.")
 
     parser.add_argument('--missing_ratio', type=float, default=0., help='Ratio of Missing Values.')
     parser.add_argument('--pred_len', type=int, default=0, help='Length of Predictions.')

@@ -9,12 +9,12 @@ mkdir -p Logs/hpo/ili_delta/2016_17test_tau/tau03
 TS=$(date +%F_%H-%M-%S)
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 nohup python hpo_grid_search.py \
   --base-config Config/ili.yaml \
-  --train-npz Data/datasets/ili_delta/2016_17test_tau/tau03/ili_eng_2016_2017_T35_p7_train.npz \
-  --val-npz   Data/datasets/ili_delta/2016_17test_tau/tau03/ili_eng_2016_2017_T35_p7_val.npz \
+  --train-npz Data/datasets/ili_delta/2016_17test_tau/tau03/ili_eng_2016_2017_T42_p7_train.npz \
+  --val-npz   Data/datasets/ili_delta/2016_17test_tau/tau03/ili_eng_2016_2017_T42_p7_val.npz \
   --d-model 64 128 \
   --base-lr 1e-5 \
   --batch-size 64 128 \
-  --max-epochs 18000 --save-cycle 1800 --val-num-repeats 1 \
+  --max-epochs 18000 --save-cycle 1800 --val-num-repeats 3 \
   --gpu-slots "${GPU}:2" \
   --experiment-name eng_2016_2017_tau03_p7 \
   --output-root outputs/hpo/ili_delta/2016_17test_tau/tau03 \
