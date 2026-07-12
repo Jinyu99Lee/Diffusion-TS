@@ -21,6 +21,34 @@ from engine.solver import Trainer
 from Data.build_dataloader import build_dataloader
 from Utils.io_utils import load_yaml_config, merge_opts_to_config, instantiate_from_config, seed_everything
 
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Window-geometry keys the converters (ili_to_npz.py / ili_iaaft_to_npz.py)
+# embed in the training npz meta. Sonnet's synthetic loader rejects delta
+# ('target_shifted') windows unless best_synth.npz carries them too.
+GEOMETRY_META_KEYS = ("layout", "target_delay", "lookback", "pred_len")
+
+
+def train_npz_geometry_meta(best: dict) -> dict:
+    """Read the geometry meta out of the training npz named in best_run.json."""
+    train_npz = best.get("train_npz")
+    if not train_npz:
+        return {}
+    path = train_npz if os.path.isabs(train_npz) else os.path.join(REPO_ROOT, train_npz)
+    if not os.path.exists(path):
+        print(f"[warn] train npz not found ({path}); best_synth meta will lack "
+              f"{'/'.join(GEOMETRY_META_KEYS)}")
+        return {}
+    with np.load(path, allow_pickle=True) as payload:
+        if "meta" not in payload.files:
+            return {}
+        try:
+            meta = json.loads(str(payload["meta"]))
+        except (json.JSONDecodeError, TypeError):
+            print(f"[warn] cannot parse meta in {path}; ignoring")
+            return {}
+    return {k: meta[k] for k in GEOMETRY_META_KEYS if k in meta}
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate final synthetic npz from best HPO run.")
@@ -78,6 +106,9 @@ def main():
 
     out = args.output or os.path.join(os.path.dirname(args.best_json), "best_synth.npz")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    geometry = train_npz_geometry_meta(best)
+    if geometry:
+        print(f"[gen] geometry meta from train npz: {geometry}")
     np.savez_compressed(out, data=samples.astype(np.float32),
                         meta=np.array(json.dumps({
                             "best_run_id": best["best_run_id"],
@@ -86,6 +117,7 @@ def main():
                             "num_generated": int(samples.shape[0]),
                             "seq_length": best["seq_length"],
                             "feature_size": best["feature_size"],
+                            **geometry,
                         })))
     print(f"[gen] saved {out}  shape={samples.shape}")
 
