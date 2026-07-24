@@ -1,0 +1,70 @@
+model:
+  target: Models.interpretable_diffusion.gaussian_diffusion.Diffusion_TS
+  params:
+    seq_length: 432       # T = lookback 336 + horizon 96; HPO infers/overrides this.
+    feature_size: 7
+    n_layer_enc: 3
+    n_layer_dec: 2
+    d_model: 64
+    timesteps: 500
+    sampling_timesteps: 500
+    loss_type: 'l1'
+    beta_schedule: 'cosine'
+    n_heads: 4
+    mlp_hidden_times: 4
+    attn_pd: 0.0
+    resid_pd: 0.0
+    kernel_size: 1
+    padding_size: 0
+
+solver:
+  base_lr: 1.0e-5
+  max_epochs: 18000
+  results_folder: ./Checkpoints_etth1
+  gradient_accumulate_every: 2
+  save_cycle: 1800
+  val_seed: 2024
+  val_num_repeats: 1
+  ema:
+    decay: 0.995
+    update_interval: 10
+
+  scheduler:
+    target: engine.lr_sch.ReduceLROnPlateauWithWarmup
+    params:
+      factor: 0.5
+      patience: 4000
+      min_lr: 1.0e-5
+      threshold: 1.0e-1
+      threshold_mode: rel
+      warmup_lr: 8.0e-4
+      warmup: 500
+      verbose: False
+
+dataloader:
+  # The standalone converter owns the sample-axis split. Both datasets receive
+  # the same paths so NPZDataset fits scaling on generator-train only.
+  train_dataset:
+    target: Utils.Data_utils.npz_datasets.NPZDataset
+    params:
+      name: etth1
+      train_path: ./Data/datasets/etth1/T432/etth1_T432_p96_train.npz
+      val_path: ./Data/datasets/etth1/T432/etth1_T432_p96_val.npz
+      period: train
+      neg_one_to_one: True
+      seed: 123
+
+  val_dataset:
+    target: Utils.Data_utils.npz_datasets.NPZDataset
+    params:
+      name: etth1
+      train_path: ./Data/datasets/etth1/T432/etth1_T432_p96_train.npz
+      val_path: ./Data/datasets/etth1/T432/etth1_T432_p96_val.npz
+      period: val
+      neg_one_to_one: True
+      seed: 123
+
+  batch_size: 64
+  val_batch_size: 64
+  sample_size: 256
+  shuffle: True

@@ -9,8 +9,8 @@ lowest ``best_val_loss`` is written to ``best_run.json`` so it can later be
 re-loaded by ``rerun_best_hpo.py`` to generate the final synthetic npz.
 
 Dataset inputs:
-  * ILI    : --train-npz <train.npz> --val-npz <val.npz>   (pre-split converter output)
-  * Weather: --data-npz <full.npz> --split-method full_train_recent_blocks
+  * Pre-split: --train-npz <train.npz> [--val-npz <val.npz>]
+  * Single NPZ: --data-npz <full.npz> [--split-method <method>]
 
 ``seq_length`` (T) and ``feature_size`` (D) are inferred from the npz and
 injected automatically, so the chosen base config need not match the data.
@@ -54,14 +54,16 @@ SWEEP_SPECS = [
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Grid-search HPO for Diffusion-TS")
-    p.add_argument("--base-config", required=True, help="Base YAML to clone (Config/ili.yaml or Config/weather.yaml).")
+    p.add_argument("--base-config", required=True, help="Base YAML configuration to clone.")
     # dataset inputs (one of the two modes)
-    p.add_argument("--train-npz", default=None, help="ILI gen-train npz.")
-    p.add_argument("--val-npz", default=None, help="ILI gen-val npz.")
-    p.add_argument("--data-npz", default=None, help="Weather single npz (split in-framework).")
+    p.add_argument("--train-npz", default=None, help="Explicit training NPZ for pre-split input mode.")
+    p.add_argument("--val-npz", default=None, help="Explicit validation NPZ used with --train-npz.")
+    p.add_argument("--data-npz", default=None, help="Single NPZ to split into training and validation in-framework.")
     p.add_argument("--split-method", default="full_train_recent_blocks",
-                   choices=("full_train_recent_blocks", "tail_holdout"))
-    p.add_argument("--valid-perc", type=float, default=0.1)
+                   choices=("full_train_recent_blocks", "tail_holdout"),
+                   help="Split method used with --data-npz.")
+    p.add_argument("--valid-perc", type=float, default=0.1,
+                   help="Validation fraction used with --data-npz.")
     # swept hyper-parameters (each accepts a list)
     for flag, _, typ in SWEEP_SPECS:
         p.add_argument(f"--{flag.replace('_', '-')}", dest=flag, type=typ, nargs="+", default=None)
@@ -78,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="List jobs without running them.")
     args = p.parse_args()
     if args.data_npz is None and args.train_npz is None:
-        p.error("Provide --data-npz (weather) or --train-npz [+ --val-npz] (ili).")
+        p.error("Provide either --data-npz or --train-npz [--val-npz].")
     return args
 
 
